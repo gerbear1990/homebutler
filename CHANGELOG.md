@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### 🐛 Fixes
+
+- `network scan` left the HOSTNAME column empty for every device on the LAN. Reverse lookups went to the configured system resolver, and a public resolver holds no delegation for the RFC1918 reverse zones — so every local address came back NXDOMAIN and the column that exists to tell one device from another showed nothing but IPs. Private addresses are now asked of the default gateway first, read from `/proc/net/route`, which on a home network is normally the resolver authoritative for the LAN zone; the system resolver is still tried after it, and is still the only one used for public addresses. Lookups also run concurrently with a one-second bound each, so a scan of a busy subnet no longer serialises one resolver timeout per device
+
 ## [0.40.0](https://github.com/Higangssh/homebutler/compare/v0.39.0...v0.40.0) - 2026-09-28
 
 **1.0 promises that what homebutler answers with will not move under the people who build on it, and until this release most of that promise could not be checked.** The golden file read the fields of three commands and named the type of everything else, so a field renamed inside `docker_list`, a status word dropped from `install_purge`, or a snapshot an older release wrote could all change with the build still green. All of it is under the test now: every tool's answer field by field, the words a status or an argument can hold, the five Proxmox reads, and a snapshot from each release whose format changed.

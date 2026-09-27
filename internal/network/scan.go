@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,18 +48,121 @@ func ScanContext(ctx context.Context) ([]Device, error) {
 		return nil, fmt.Errorf("failed to read ARP table: %w", err)
 	}
 
-	// Resolve hostnames
+	resolveHostnames(ctx, devices)
+
+	return devices, nil
+}
+
+// ptrTimeout bounds a single reverse lookup so an unreachable resolver cannot
+// stall the scan.
+const ptrTimeout = time.Second
+
+// resolveHostnames fills in Device.Hostname for each device via reverse DNS.
+// Lookups run concurrently because a scan typically covers dozens of addresses
+// and each one may have to wait out a resolver timeout.
+func resolveHostnames(ctx context.Context, devices []Device) {
+	gateway := gatewayResolver()
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 16)
+
 	for i := range devices {
 		if ctx.Err() != nil {
 			break
 		}
-		names, err := net.LookupAddr(devices[i].IP)
-		if err == nil && len(names) > 0 {
-			devices[i].Hostname = strings.TrimSuffix(names[0], ".")
-		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(d *Device) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			d.Hostname = lookupPTR(ctx, d.IP, gateway)
+		}(&devices[i])
 	}
 
-	return devices, nil
+	wg.Wait()
+}
+
+// lookupPTR returns the first PTR name for ip, or "" if nothing resolves.
+func lookupPTR(ctx context.Context, ip string, gateway *net.Resolver) string {
+	resolvers := []*net.Resolver{net.DefaultResolver}
+	if gateway != nil && isPrivateIP(ip) {
+		// Ask the LAN resolver first. Public resolvers hold no delegation for the
+		// RFC1918 reverse zones, so they answer NXDOMAIN for every local address,
+		// and sending those queries upstream leaks the internal address plan.
+		resolvers = []*net.Resolver{gateway, net.DefaultResolver}
+	}
+
+	for _, r := range resolvers {
+		if name := firstPTRName(ctx, r, ip); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+func firstPTRName(ctx context.Context, r *net.Resolver, ip string) string {
+	ctx, cancel := context.WithTimeout(ctx, ptrTimeout)
+	defer cancel()
+
+	names, err := r.LookupAddr(ctx, ip)
+	if err != nil || len(names) == 0 {
+		return ""
+	}
+	return strings.TrimSuffix(names[0], ".")
+}
+
+func isPrivateIP(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && parsed.IsPrivate()
+}
+
+// gatewayResolver returns a resolver bound to the default gateway, which on most
+// home networks is also the authoritative DNS server for the LAN zone.
+// It returns nil when no default gateway can be determined.
+func gatewayResolver() *net.Resolver {
+	gw := defaultGateway()
+	if gw == "" {
+		return nil
+	}
+
+	addr := net.JoinHostPort(gw, "53")
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+}
+
+// defaultGateway returns the IPv4 default gateway, or "" if there is none.
+// Only Linux is supported; elsewhere the route table is unreadable and callers
+// fall back to the system resolver alone.
+func defaultGateway() string {
+	data, err := os.ReadFile("/proc/net/route")
+	if err != nil {
+		return ""
+	}
+	return parseDefaultGateway(string(data))
+}
+
+// parseDefaultGateway extracts the gateway of the first default route (a
+// destination of 00000000) from /proc/net/route contents.
+func parseDefaultGateway(routes string) string {
+	lines := strings.Split(routes, "\n")
+	for _, line := range lines[1:] { // first line is the column header
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[1] != "00000000" {
+			continue
+		}
+		// Addresses are little-endian hex words: "051F10AC" is 172.16.31.5.
+		v, err := strconv.ParseUint(fields[2], 16, 32)
+		if err != nil || v == 0 {
+			continue
+		}
+		return net.IPv4(byte(v), byte(v>>8), byte(v>>16), byte(v>>24)).String()
+	}
+	return ""
 }
 
 func getLocalSubnet() (string, error) {

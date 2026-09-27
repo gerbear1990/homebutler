@@ -249,3 +249,55 @@ func TestScan(t *testing.T) {
 	}
 	_ = devices
 }
+
+// Checked against the parser with the little-endian word reversed: reading
+// "0100000A" big-endian yields 1.0.0.10, which fails this.
+func TestParseDefaultGateway(t *testing.T) {
+	const routes = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n" +
+		"eth0\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n" +
+		"eth0\t0000000A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n"
+
+	if gw := parseDefaultGateway(routes); gw != "10.0.0.1" {
+		t.Errorf("gateway = %q, want 10.0.0.1", gw)
+	}
+}
+
+// A host with no default route must yield "" rather than a bogus 0.0.0.0, which
+// gatewayResolver would otherwise dial as a DNS server on every scan.
+func TestParseDefaultGatewayNoDefaultRoute(t *testing.T) {
+	const onLinkOnly = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n" +
+		"docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n"
+
+	if gw := parseDefaultGateway(onLinkOnly); gw != "" {
+		t.Errorf("gateway = %q, want empty", gw)
+	}
+
+	// A default route can itself be on-link (gateway 00000000), as a point-to-point
+	// tunnel installs it. There is no address to query in that case.
+	const onLinkDefault = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n" +
+		"tun0\t00000000\t00000000\t0001\t0\t0\t50\t00000000\t0\t0\t0\n"
+
+	if gw := parseDefaultGateway(onLinkDefault); gw != "" {
+		t.Errorf("gateway = %q, want empty for an on-link default route", gw)
+	}
+
+	if gw := parseDefaultGateway(""); gw != "" {
+		t.Errorf("gateway = %q, want empty for empty input", gw)
+	}
+}
+
+// The private check is what decides whether the gateway is asked at all, so a
+// public address slipping through would send LAN queries to a resolver that
+// cannot answer them.
+func TestIsPrivateIP(t *testing.T) {
+	for _, ip := range []string{"10.0.0.5", "172.16.0.2", "192.168.0.1"} {
+		if !isPrivateIP(ip) {
+			t.Errorf("%s: want private", ip)
+		}
+	}
+	for _, ip := range []string{"8.8.8.8", "1.1.1.1", "not-an-ip", ""} {
+		if isPrivateIP(ip) {
+			t.Errorf("%q: want not private", ip)
+		}
+	}
+}
